@@ -1,8 +1,21 @@
 from airflow.hooks.base import BaseHook
+from airflow.exceptions import AirflowFailException
+from minio import Minio
 from datetime import datetime
 from unidecode import unidecode
 import requests
+from io import BytesIO
 import json
+
+def _get_minio_client():
+    minio = BaseHook.get_connection('minio')
+    client = Minio(
+        endpoint=minio.extra_dejson['endpoint_url'].split('//')[1],
+        access_key=minio.login,
+        secret_key=minio.password,
+        secure=False
+    )
+    return client
 
 
 def clean_city_list(cities) -> list:
@@ -79,7 +92,7 @@ def _get_weather(coords_list):
                 "rain":rn,
                 "rain_1h":rn1h,
                 "clouds":cl,
-                "requested_at_utc":datetime.now().astimezone()
+                "execution_date":datetime.now().isoformat()+"Z"
                 }
             )
         else:
@@ -90,3 +103,68 @@ def _get_weather(coords_list):
             })
 
     return results
+
+def _store_weather_data(weather_data:list, execution_date:datetime):
+    client = _get_minio_client()
+    bucket_name = "weather-data"
+    if not client.bucket_exists(bucket_name):
+        print(f"Bucker {bucket_name} not found, creating it...")
+        client.make_bucket(bucket_name)
+        
+    # Desglosamos las fechas para obtener rutas dinamicas
+    year = execution_date.strftime('%Y')
+    month = execution_date.strftime('%m')
+    day = execution_date.strftime('%d')
+    
+    
+    for item in weather_data:
+        city = item['city']
+        ts = execution_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+        data = json.dumps(item, ensure_ascii=False, default=str).encode("utf8")
+        
+        object_name = f"bronze/weather/{year}/{month}/{day}/{city}-{ts}.json"
+        
+        objw = client.put_object(
+            bucket_name=bucket_name,
+            object_name=object_name,
+            data=BytesIO(data),
+            length=len(data)
+        )
+    return f's3://{bucket_name}/bronze/weather/{year}/{month}/{day}/'
+
+#! Bronze 1.0
+BUCKET = "weather-data"
+
+def _list_bronze_data(partition_date:str)->dict:
+    """
+    Vamos a listar los datos en Bronze para una partición y devuelve métricas.
+    """
+    client = _get_minio_client()
+    prefix = f"bronze/weather/{partition_date}"
+    
+    assert client.bucket_exists(BUCKET), f"Bucket {BUCKET} no existe"
+    
+    files = []
+    total_bytes = 0
+    
+    for obj in client.list_objects(BUCKET, prefix=prefix, recursive=True):
+        name = getattr(obj, "object_name", getattr(obj,"key",None))
+        size = getattr(obj, "size", 0)
+        if name and name.endswith(".json"):
+            files.append(name)
+            total_bytes += int(size or 0)
+    
+    count = len(files)
+    if count == 0:
+        raise AirflowFailException(
+            f"No se encontraron JSONs en s3://{BUCKET}/{prefix}. Abortando particion {partition_date}"
+        )
+    files.sort()
+    return {
+        "partition_date": partition_date,
+        "bronze_prefix": prefix,
+        "files":files,
+        "count":count,
+        "bytes":total_bytes
+    }

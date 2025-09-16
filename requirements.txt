@@ -1,2 +1,6 @@
 Unidecode==1.4.0
 requests==2.32.5
+minio==7.2.14
+pandas==2.3.2
+psycopg2-binary==2.9.10
+pyarrow==16.1.0
